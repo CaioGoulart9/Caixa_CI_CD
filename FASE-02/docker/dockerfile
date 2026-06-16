@@ -1,5 +1,7 @@
 FROM eclipse-temurin:21-jdk-alpine AS build
 
+RUN apk upgrade --no-cache openssl libcrypto3 libssl3
+
 WORKDIR /app
 
 COPY mvnw ./
@@ -12,7 +14,8 @@ RUN ./mvnw package -DskipTests -B
 
 FROM eclipse-temurin:21-jre-alpine AS runtime
 
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+RUN apk upgrade --no-cache openssl libcrypto3 libssl3 \
+  && addgroup -S appgroup && adduser -S appuser -G appgroup
 
 WORKDIR /app
 

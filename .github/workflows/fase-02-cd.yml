@@ -1,0 +1,189 @@
+name: Fase 02 - CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  JAVA_VERSION: "21"
+  IMAGE_NAME: caixa-iac
+  REGISTRY: ghcr.io
+  SONAR_ORGANIZATION: caiogoulart9
+  SONAR_PROJECT_KEY: Caixa_CI_CD
+  SONAR_PROJECT_NAME: Caixa_CI_CD
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    environment: Caixa_Token
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Cache SonarCloud packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.sonar/cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+
+      - name: Ensure SonarCloud project exists
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_ORGANIZATION: ${{ env.SONAR_ORGANIZATION }}
+          SONAR_PROJECT_KEY: ${{ env.SONAR_PROJECT_KEY }}
+          SONAR_PROJECT_NAME: ${{ env.SONAR_PROJECT_NAME }}
+        run: bash .github/scripts/ensure-sonar-project.sh
+
+      - name: Build, test and generate coverage
+        run: ./mvnw clean verify --batch-mode
+
+      - name: Verify JaCoCo report
+        run: |
+          test -f target/site/jacoco/jacoco.xml
+          echo "JaCoCo report gerado com sucesso"
+
+      - name: Analyze with SonarCloud
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: >
+          ./mvnw sonar:sonar --batch-mode
+          -Dsonar.host.url=https://sonarcloud.io
+          -Dsonar.organization=${{ env.SONAR_ORGANIZATION }}
+          -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+          -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+
+  docker-build-push:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image repository (GHCR requires lowercase)
+        run: echo "IMAGE_REPO=${{ env.REGISTRY }}/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/${{ env.IMAGE_NAME }}" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_REPO }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: FASE-02/docker/dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Set image repository (GHCR requires lowercase)
+        run: echo "IMAGE_REPO=${{ env.REGISTRY }}/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/${{ env.IMAGE_NAME }}" >> $GITHUB_ENV
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_REPO }}:latest
+          format: table
+          scanners: vuln
+          exit-code: 1
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+  deploy:
+    name: Deploy (Docker Compose)
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image repository (GHCR requires lowercase)
+        run: echo "IMAGE_REPO=${{ env.REGISTRY }}/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/${{ env.IMAGE_NAME }}" >> $GITHUB_ENV
+
+      - name: Validate Docker Compose
+        run: docker compose -f FASE-02/docker-compose.yml config --quiet
+
+      - name: Smoke test — pull image and health check
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          IMAGE="${{ env.IMAGE_REPO }}:latest"
+          docker pull "$IMAGE"
+          docker run -d --name smoke-test -p 8080:8080 "$IMAGE"
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/actuator/health > /dev/null; then
+              echo "Health check OK"
+              docker stop smoke-test
+              docker rm smoke-test
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Health check failed"
+          docker logs smoke-test
+          docker stop smoke-test || true
+          docker rm smoke-test || true
+          exit 1
+
+      - name: Deploy summary
+        run: |
+          echo "Imagem publicada: ${{ env.IMAGE_REPO }}:latest"
+          echo ""
+          echo "Deploy local (build + Compose):"
+          echo "  ./FASE-02/scripts/deploy.sh compose"
+          echo ""
+          echo "Deploy com imagem do registry:"
+          echo "  GHCR_IMAGE=${{ env.IMAGE_REPO }}:latest ./FASE-02/scripts/deploy.sh registry"
